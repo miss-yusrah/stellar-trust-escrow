@@ -11,6 +11,20 @@
  *   cache.invalidatePrefix('escrow:')
  */
 
+// Lazy-import metrics to avoid circular deps at startup
+let _metrics = null;
+async function getMetrics() {
+  if (!_metrics) {
+    _metrics = await import('./metrics.js');
+  }
+  return _metrics;
+}
+
+/** Extract a short prefix from a cache key for metric labels (e.g. "escrows") */
+function keyPrefix(key) {
+  return key.split(':')[0] || 'unknown';
+}
+
 const store = new Map();
 
 /**
@@ -25,11 +39,20 @@ function set(key, value, ttlSeconds = 60) {
 /** @returns {*|null} */
 function get(key) {
   const entry = store.get(key);
-  if (!entry) return null;
-  if (Date.now() > entry.expiresAt) {
-    store.delete(key);
+  const prefix = keyPrefix(key);
+
+  if (!entry || Date.now() > entry.expiresAt) {
+    if (entry) store.delete(key);
+    getMetrics().then(({ cacheMissesTotal, cacheSize }) => {
+      cacheMissesTotal.inc({ key_prefix: prefix });
+      cacheSize.set(store.size);
+    });
     return null;
   }
+
+  getMetrics().then(({ cacheHitsTotal }) => {
+    cacheHitsTotal.inc({ key_prefix: prefix });
+  });
   return entry.value;
 }
 
