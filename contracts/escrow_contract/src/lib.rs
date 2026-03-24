@@ -510,10 +510,11 @@ impl EscrowContract {
             &meta.freelancer,
             &amount,
         );
+        // STE-04 fix: return error instead of silently clamping to 0
         meta.remaining_balance = meta
             .remaining_balance
             .checked_sub(amount)
-            .unwrap_or(0);
+            .ok_or(EscrowError::AmountMismatch)?;
 
         events::emit_milestone_approved(&env, escrow_id, milestone_id, amount);
         events::emit_funds_released(&env, escrow_id, &meta.freelancer, amount);
@@ -527,6 +528,8 @@ impl EscrowContract {
 
         if all_approved && meta.milestone_count > 0 {
             meta.status = EscrowStatus::Completed;
+            // STE-03 fix: emit completion event so the indexer can update DB
+            events::emit_escrow_completed(&env, escrow_id);
         }
 
         ContractStorage::save_escrow_meta(&env, &meta);
@@ -577,25 +580,44 @@ impl EscrowContract {
 
     /// Releases funds to the freelancer for an approved milestone.
     ///
-    /// This is callable by the admin to manually release funds in edge cases.
-    /// Normal flow goes through `approve_milestone` which handles release
-    /// atomically. Calling this on an already-released milestone is a no-op
-    /// guard (milestone must be Approved and balance must cover the amount).
+    /// Admin-only fallback for edge cases. Normal flow uses `approve_milestone`
+    /// which handles approval + release atomically.
+    ///
+    /// # Security (STE-01, STE-02)
+    /// - Requires admin authorization to prevent unauthorized calls.
+    /// - Milestone must be `Approved` (not already `Released`) to prevent
+    ///   double-payment.
     ///
     /// # Arguments
+    /// * `caller`       - Must be the contract admin.
     /// * `escrow_id`    - Target escrow.
     /// * `milestone_id` - The approved milestone to pay out.
     ///
     /// # Errors
+    /// * `EscrowError::AdminOnly`             — caller is not admin
     /// * `EscrowError::InvalidMilestoneState` — milestone not Approved
+    /// * `EscrowError::AmountMismatch`        — remaining balance insufficient
     ///
     /// # Events
     /// Emits `FundsReleased`
     pub fn release_funds(
         env: Env,
+        caller: Address,
         escrow_id: u64,
         milestone_id: u32,
     ) -> Result<(), EscrowError> {
+        // STE-01 fix: require admin authorization
+        ContractStorage::require_initialized(&env)?;
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(EscrowError::NotInitialized)?;
+        caller.require_auth();
+        if caller != admin {
+            return Err(EscrowError::AdminOnly);
+        }
+
         let mut meta = ContractStorage::load_escrow_meta(&env, escrow_id)?;
         let milestone = ContractStorage::load_milestone(&env, escrow_id, milestone_id)?;
 
@@ -604,12 +626,18 @@ impl EscrowContract {
         }
 
         let amount = milestone.amount;
+
+        // STE-04 fix: return error instead of silently clamping to 0
+        meta.remaining_balance = meta
+            .remaining_balance
+            .checked_sub(amount)
+            .ok_or(EscrowError::AmountMismatch)?;
+
         token::Client::new(&env, &meta.token).transfer(
             &env.current_contract_address(),
             &meta.freelancer,
             &amount,
         );
-        meta.remaining_balance = meta.remaining_balance.checked_sub(amount).unwrap_or(0);
         ContractStorage::save_escrow_meta(&env, &meta);
 
         events::emit_funds_released(&env, escrow_id, &meta.freelancer, amount);
